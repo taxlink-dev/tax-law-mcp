@@ -18,7 +18,7 @@ info:
     url: "https://github.com/kentaroajisaka/tax-law-mcp"
 
 servers:
-  - url: "https://tax-law-mcp.vercel.app"
+  - url: "https://tax-law-mcp-vert.vercel.app"
     description: "本番環境"
 
 paths:
