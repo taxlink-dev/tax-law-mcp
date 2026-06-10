@@ -1,3 +1,5 @@
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+
 const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
 const CHATWORK_API_BASE = "https://api.chatwork.com/v2";
 
@@ -11,12 +13,10 @@ type ChatworkWebhookPayload = {
     send_time?: number;
     update_time?: number;
   };
-};
-
-type ChatMessage = {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string;
-  tool_call_id?: string;
+  room_id?: number | string;
+  body?: string;
+  text?: string;
+  message?: string;
 };
 
 type ToolCall = {
@@ -36,14 +36,11 @@ function env(name: string): string {
   return value;
 }
 
-function jsonResponse(status: number, body: unknown) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json; charset=utf-8" },
-  });
+function sendJson(res: VercelResponse, status: number, body: unknown) {
+  return res.status(status).json(body);
 }
 
-function extractQuestion(payload: ChatworkWebhookPayload | any): {
+function extractQuestion(payload: ChatworkWebhookPayload): {
   roomId: string;
   messageBody: string;
   question: string;
@@ -96,10 +93,12 @@ async function postChatwork(roomId: string, body: string) {
   return res.json();
 }
 
-async function callTaxLawApi(path: string, params: Record<string, string | number | undefined>) {
+async function callTaxLawApi(
+  path: string,
+  params: Record<string, string | number | undefined>
+) {
   const baseUrl =
-    process.env.TAX_LAW_API_BASE_URL ||
-    "https://tax-law-mcp-vert.vercel.app";
+    process.env.TAX_LAW_API_BASE_URL || "https://tax-law-mcp-vert.vercel.app";
 
   const url = new URL(path, baseUrl);
 
@@ -230,8 +229,8 @@ async function generateTlaAnswer(question: string): Promise<string> {
         parameters: {
           type: "object",
           properties: {
-            law_name: { type: "string", description: "法令名または略称。例：所得税法、所法、法人税法、消費税法" },
-            article: { type: "string", description: "条文番号。例：33、36、33の2" },
+            law_name: { type: "string" },
+            article: { type: "string" },
             paragraph: { type: "integer" },
             item: { type: "integer" },
             format: { type: "string", enum: ["markdown", "toc"] },
@@ -249,7 +248,10 @@ async function generateTlaAnswer(question: string): Promise<string> {
           type: "object",
           properties: {
             keyword: { type: "string" },
-            law_type: { type: "string", enum: ["Act", "CabinetOrder", "MinisterialOrdinance"] },
+            law_type: {
+              type: "string",
+              enum: ["Act", "CabinetOrder", "MinisterialOrdinance"],
+            },
             limit: { type: "integer" },
           },
           required: ["keyword"],
@@ -264,8 +266,8 @@ async function generateTlaAnswer(question: string): Promise<string> {
         parameters: {
           type: "object",
           properties: {
-            tsutatsu_name: { type: "string", description: "通達名または略称。例：所基通、法基通、消基通、措通（譲渡）" },
-            number: { type: "string", description: "通達番号。例：36-40、2-1-1" },
+            tsutatsu_name: { type: "string" },
+            number: { type: "string" },
           },
           required: ["tsutatsu_name", "number"],
         },
@@ -320,13 +322,13 @@ async function generateTlaAnswer(question: string): Promise<string> {
     },
   ];
 
-  const messages: ChatMessage[] = [
+  const messages: any[] = [
     { role: "system", content: systemPrompt },
     { role: "user", content: question },
   ];
 
   for (let i = 0; i < 6; i++) {
-    const res = await fetch(OPENAI_API_URL, {
+    const openaiRes = await fetch(OPENAI_API_URL, {
       method: "POST",
       headers: {
         authorization: `Bearer ${apiKey}`,
@@ -340,12 +342,12 @@ async function generateTlaAnswer(question: string): Promise<string> {
       }),
     });
 
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`OpenAI API failed: ${res.status} ${text}`);
+    if (!openaiRes.ok) {
+      const text = await openaiRes.text();
+      throw new Error(`OpenAI API failed: ${openaiRes.status} ${text}`);
     }
 
-    const data: any = await res.json();
+    const data: any = await openaiRes.json();
     const message = data.choices?.[0]?.message;
 
     if (!message) {
@@ -356,11 +358,7 @@ async function generateTlaAnswer(question: string): Promise<string> {
       return message.content || "TLA回答を生成できませんでした。";
     }
 
-    messages.push({
-      role: "assistant",
-      content: message.content || "",
-      ...(message.tool_calls ? ({ tool_calls: message.tool_calls } as any) : {}),
-    } as any);
+    messages.push(message);
 
     for (const toolCall of message.tool_calls as ToolCall[]) {
       const toolResult = await executeToolCall(toolCall);
@@ -375,10 +373,10 @@ async function generateTlaAnswer(question: string): Promise<string> {
   return "ツール確認が規定回数内に収束しませんでした。所長確認必須です。";
 }
 
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     if (req.method === "GET") {
-      return jsonResponse(200, {
+      return sendJson(res, 200, {
         ok: true,
         message: "TLA Chatwork endpoint is running.",
         usage: "POST a Chatwork webhook payload or JSON { text: 'TLA実行 ...' }",
@@ -386,29 +384,35 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     if (req.method !== "POST") {
-      return jsonResponse(405, { ok: false, error: "Method not allowed" });
+      return sendJson(res, 405, { ok: false, error: "Method not allowed" });
     }
 
-    const raw = await req.text();
+    let payload: ChatworkWebhookPayload = {};
 
-    let payload: any;
-    try {
-      payload = JSON.parse(raw || "{}");
-    } catch {
-      payload = { text: raw };
+    if (typeof req.body === "string") {
+      try {
+        payload = JSON.parse(req.body || "{}");
+      } catch {
+        payload = { text: req.body };
+      }
+    } else if (req.body && typeof req.body === "object") {
+      payload = req.body;
     }
 
     const { roomId, question } = extractQuestion(payload);
 
     if (!question) {
-      return jsonResponse(200, {
+      return sendJson(res, 200, {
         ok: true,
         skipped: true,
         reason: "Message does not start with TLA実行.",
       });
     }
 
-    await postChatwork(roomId, "[info][title]TLA受付[/title]税務相談の根拠確認を開始します。[/info]");
+    await postChatwork(
+      roomId,
+      "[info][title]TLA受付[/title]税務相談の根拠確認を開始します。[/info]"
+    );
 
     const answer = await generateTlaAnswer(question);
 
@@ -416,7 +420,7 @@ export default async function handler(req: Request): Promise<Response> {
 
     await postChatwork(roomId, chatworkMessage.slice(0, 65000));
 
-    return jsonResponse(200, { ok: true });
+    return sendJson(res, 200, { ok: true });
   } catch (error: any) {
     const message = error?.message || String(error);
 
@@ -432,6 +436,6 @@ export default async function handler(req: Request): Promise<Response> {
       // ignore secondary error
     }
 
-    return jsonResponse(500, { ok: false, error: message });
+    return sendJson(res, 500, { ok: false, error: message });
   }
 }
