@@ -40,6 +40,37 @@ function sendJson(res: VercelResponse, status: number, body: unknown) {
   return res.status(status).json(body);
 }
 
+function parsePayload(req: VercelRequest): ChatworkWebhookPayload {
+  const body: any = req.body;
+
+  if (!body) {
+    return {};
+  }
+
+  if (typeof body === "string") {
+    try {
+      return JSON.parse(body || "{}");
+    } catch {
+      return { text: body };
+    }
+  }
+
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer(body)) {
+    const text = body.toString("utf8");
+    try {
+      return JSON.parse(text || "{}");
+    } catch {
+      return { text };
+    }
+  }
+
+  if (typeof body === "object") {
+    return body;
+  }
+
+  return {};
+}
+
 function extractQuestion(payload: ChatworkWebhookPayload): {
   roomId: string;
   messageBody: string;
@@ -194,6 +225,9 @@ async function generateTlaAnswer(question: string): Promise<string> {
 6. 条文・通達・裁決事例の内容と矛盾する回答をしてはならない。
 7. 根拠条文・通達を広げすぎず、中心根拠を優先すること。
 8. 顧客向け返信ドラフトはChatworkで送る前提で簡潔にすること。
+9. 顧客向け返信ドラフトでは、専門用語を必要最小限にし、顧客が次に何をすればよいか分かる文章にすること。
+10. 裁決事例が必須でない論点では、無理に裁決事例を探し続けず、条文・通達・国税庁資料を中心根拠として整理してよい。
+11. ただし、事実認定・否認リスク・租税回避性が問題となる場合は、裁決事例の確認要否を明示すること。
 
 出力形式：
 【論点分類】
@@ -373,52 +407,77 @@ async function generateTlaAnswer(question: string): Promise<string> {
   return "ツール確認が規定回数内に収束しませんでした。所長確認必須です。";
 }
 
+async function runTla(question: string, roomId: string) {
+  await postChatwork(
+    roomId,
+    "[info][title]TLA受付[/title]税務相談の根拠確認を開始します。[/info]"
+  );
+
+  const answer = await generateTlaAnswer(question);
+
+  const chatworkMessage = `[info][title]TLA｜TaxLink Legal Assist 出力結果[/title]${answer}[/info]`;
+
+  await postChatwork(roomId, chatworkMessage.slice(0, 65000));
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     if (req.method === "GET") {
-      return sendJson(res, 200, {
-        ok: true,
-        message: "TLA Chatwork endpoint is running.",
-        usage: "POST a Chatwork webhook payload or JSON { text: 'TLA実行 ...' }",
-      });
+      const queryText =
+        typeof req.query.text === "string" ? req.query.text : "";
+
+      if (!queryText) {
+        return sendJson(res, 200, {
+          ok: true,
+          message: "TLA Chatwork endpoint is running.",
+          usage:
+            "GET /api/chatwork-tla?text=TLA実行... または POST JSON { text: 'TLA実行 ...' }",
+        });
+      }
+
+      const roomId = env("TLA_LOG_ROOM_ID");
+      const normalized = queryText.trim();
+
+      if (!normalized.startsWith("TLA実行")) {
+        return sendJson(res, 200, {
+          ok: true,
+          skipped: true,
+          reason: "Query text does not start with TLA実行.",
+          received: normalized,
+        });
+      }
+
+      const question = normalized.replace(/^TLA実行\s*/u, "").trim();
+
+      if (!question) {
+        return sendJson(res, 400, {
+          ok: false,
+          error: "TLA実行 の後に質問文がありません。",
+        });
+      }
+
+      await runTla(question, roomId);
+
+      return sendJson(res, 200, { ok: true });
     }
 
     if (req.method !== "POST") {
       return sendJson(res, 405, { ok: false, error: "Method not allowed" });
     }
 
-    let payload: ChatworkWebhookPayload = {};
-
-    if (typeof req.body === "string") {
-      try {
-        payload = JSON.parse(req.body || "{}");
-      } catch {
-        payload = { text: req.body };
-      }
-    } else if (req.body && typeof req.body === "object") {
-      payload = req.body;
-    }
-
-    const { roomId, question } = extractQuestion(payload);
+    const payload = parsePayload(req);
+    const { roomId, question, messageBody } = extractQuestion(payload);
 
     if (!question) {
       return sendJson(res, 200, {
         ok: true,
         skipped: true,
         reason: "Message does not start with TLA実行.",
+        received: messageBody,
       });
     }
 
-    await postChatwork(
-      roomId,
-      "[info][title]TLA受付[/title]税務相談の根拠確認を開始します。[/info]"
-    );
-
-    const answer = await generateTlaAnswer(question);
-
-    const chatworkMessage = `[info][title]TLA｜TaxLink Legal Assist 出力結果[/title]${answer}[/info]`;
-
-    await postChatwork(roomId, chatworkMessage.slice(0, 65000));
+    await runTla(question, roomId);
 
     return sendJson(res, 200, { ok: true });
   } catch (error: any) {
