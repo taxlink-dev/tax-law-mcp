@@ -404,7 +404,38 @@ async function generateTlaAnswer(question: string): Promise<string> {
     }
   }
 
-  return "ツール確認が規定回数内に収束しませんでした。所長確認必須です。";
+  messages.push({
+    role: "system",
+    content:
+      "これ以上ツールを呼び出してはいけません。これまでに取得できた条文・通達・裁決事例の情報だけを根拠として、必ず指定の出力形式で最終回答を作成してください。取得できなかった根拠は『追加確認が必要』と明記してください。",
+  });
+
+  const finalRes = await fetch(OPENAI_API_URL, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({
+      model,
+      messages,
+      tools,
+      tool_choice: "none",
+    }),
+  });
+
+  if (!finalRes.ok) {
+    const text = await finalRes.text();
+    throw new Error(`OpenAI final API failed: ${finalRes.status} ${text}`);
+  }
+
+  const finalData: any = await finalRes.json();
+  const finalMessage = finalData.choices?.[0]?.message;
+
+  return (
+    finalMessage?.content ||
+    "ツール確認後の最終回答を生成できませんでした。所長確認必須です。"
+  );
 }
 
 async function runTla(question: string, roomId: string) {
